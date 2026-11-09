@@ -1,0 +1,105 @@
+name: Kittygram CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backend_tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_DB: kittygram
+          POSTGRES_USER: kittygram
+          POSTGRES_PASSWORD: ci-test-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U kittygram -d kittygram"
+          --health-interval 5s --health-timeout 5s --health-retries 15
+    env:
+      POSTGRES_DB: kittygram
+      POSTGRES_USER: kittygram
+      POSTGRES_PASSWORD: ci-test-password
+      DB_HOST: localhost
+      SECRET_KEY: ci-only-key-not-for-deployment
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r backend/requirements.txt
+      - run: ruff check backend
+      - run: python backend/manage.py check
+      - run: python backend/manage.py makemigrations --check --dry-run
+      - run: python backend/manage.py test cats --verbosity 2
+      - run: python -m pytest tests/test_files.py -k 'not deploy_info and not edu_provisioning'
+      - run: cmp .github/workflows/main.yml kittygram_workflow.yml
+  frontend_tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm test -- --watchAll=false --runInBand
+        env:
+          CI: 'true'
+  build_and_push:
+    needs: [backend_tests, frontend_tests]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - context: backend
+            image: kittygram_backend
+          - context: frontend
+            image: kittygram_frontend
+          - context: nginx
+            image: kittygram_gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ matrix.image }}:${{ github.sha }}
+  notify:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Telegram after all three images are published
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TO: ${{ secrets.TELEGRAM_TO }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          test -n "$TELEGRAM_TOKEN" && test -n "$TELEGRAM_TO" || {
+            echo 'Add TELEGRAM_TOKEN and TELEGRAM_TO in repository secrets'; exit 1;
+          }
+          curl --fail --silent --show-error \
+            --data-urlencode "chat_id=$TELEGRAM_TO" \
+            --data-urlencode "text=Kittygram: tests passed, Docker Hub images published. $REPOSITORY $RUN_URL" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" > /dev/null
